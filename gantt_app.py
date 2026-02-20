@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import date, datetime
-from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-DATA_FILE = Path("tasks.json")
+import gspread
+from google.oauth2.service_account import Credentials
+
 
 PRIORITY_COLORS = {
     "Niski": "#7aa6ff",
@@ -20,46 +20,98 @@ PRIORITY_COLORS = {
 }
 PRIORITY_ORDER = ["Krytyczny", "Wysoki", "Średni", "Niski"]
 
+SHEET_HEADERS = ["id", "name", "start", "plan_end", "priority", "notes", "done", "done_date"]
+
 
 @dataclass
 class Task:
     id: str
     name: str
     start: str            # ISO YYYY-MM-DD
-    plan_end: str         # ISO YYYY-MM-DD (deadline)
+    plan_end: str         # ISO YYYY-MM-DD
     priority: str
     notes: str = ""
     done: bool = False
     done_date: str = ""   # ISO YYYY-MM-DD
 
 
+@st.cache_resource
+def get_gspread_client():
+    sa = st.secrets["gcp_service_account"]
+    creds = Credentials.from_service_account_info(
+        dict(sa),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return gspread.authorize(creds)
+
+
+def get_worksheet():
+    sheet_id = st.secrets.get("SHEET_ID", "")
+    if not sheet_id:
+        raise RuntimeError("Brakuje SHEET_ID w Streamlit Secrets (Settings → Secrets).")
+    gc = get_gspread_client()
+    sh = gc.open_by_key(sheet_id)
+    return sh.sheet1  # pierwsza zakładka w pliku
+
+
+def ensure_header(ws):
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(SHEET_HEADERS)
+        return
+    if values[0] != SHEET_HEADERS:
+        ws.update("A1", [SHEET_HEADERS])
+
+
 def load_tasks() -> List[Task]:
-    if not DATA_FILE.exists():
-        return []
-    try:
-        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        tasks = []
-        for d in data:
-            tasks.append(Task(
-                id=str(d["id"]),
-                name=str(d["name"]),
-                start=str(d["start"]),
-                plan_end=str(d["plan_end"]),
-                priority=str(d["priority"]),
-                notes=str(d.get("notes", "")),
-                done=bool(d.get("done", False)),
-                done_date=str(d.get("done_date", "")),
-            ))
-        return tasks
-    except Exception:
-        return []
+    ws = get_worksheet()
+    ensure_header(ws)
+    rows = ws.get_all_records()
+    tasks: List[Task] = []
+
+    for r in rows:
+        done_val = r.get("done", False)
+        if isinstance(done_val, str):
+            done_val = done_val.strip().lower() in ["true", "1", "tak", "yes", "y"]
+
+        t = Task(
+            id=str(r.get("id", "")).strip(),
+            name=str(r.get("name", "")).strip(),
+            start=str(r.get("start", "")).strip(),
+            plan_end=str(r.get("plan_end", "")).strip(),
+            priority=str(r.get("priority", "")).strip() or "Średni",
+            notes=str(r.get("notes", "") or "").strip(),
+            done=bool(done_val),
+            done_date=str(r.get("done_date", "") or "").strip(),
+        )
+        if t.id:
+            tasks.append(t)
+
+    return tasks
 
 
 def save_tasks(tasks: List[Task]) -> None:
-    DATA_FILE.write_text(
-        json.dumps([asdict(t) for t in tasks], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    ws = get_worksheet()
+    ensure_header(ws)
+
+    ws.batch_clear(["A2:Z"])
+    if not tasks:
+        return
+
+    rows = []
+    for t in tasks:
+        rows.append([
+            t.id,
+            t.name,
+            t.start,
+            t.plan_end,
+            t.priority,
+            t.notes,
+            "TRUE" if t.done else "FALSE",
+            t.done_date,
+        ])
+
+    ws.update("A2", rows)
 
 
 def iso(d: date) -> str:
@@ -93,7 +145,6 @@ def tasks_to_df(tasks: List[Task]) -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows)
-    # trzymamy jako datetime dla edycji i wykresu
     df["Start"] = pd.to_datetime(df["Start"])
     df["Deadline"] = pd.to_datetime(df["Deadline"])
     df["Data zakończenia"] = pd.to_datetime(df["Data zakończenia"], errors="coerce")
@@ -101,12 +152,6 @@ def tasks_to_df(tasks: List[Task]) -> pd.DataFrame:
 
 
 def df_to_tasks(df: pd.DataFrame, prev_tasks: List[Task]) -> List[Task]:
-    """
-    Aktualizuje listę Task na podstawie edytowanej tabeli.
-    Zachowuje stabilne id.
-    Ustala done_date automatycznie przy przejściu done=False -> True.
-    Czyści done_date przy przejściu done=True -> False.
-    """
     prev_by_id = {t.id: t for t in prev_tasks}
     today = date.today().isoformat()
 
@@ -125,22 +170,17 @@ def df_to_tasks(df: pd.DataFrame, prev_tasks: List[Task]) -> List[Task]:
         done_now = bool(row["Zakończone"])
         done_date_raw = row.get("Data zakończenia", pd.NaT)
 
-        # daty: start/deadline do ISO
         start_iso = start_dt.isoformat()
         deadline_iso = deadline_dt.isoformat()
 
-        # done_date: auto logika
         prev_done = prev.done if prev else False
         prev_done_date = prev.done_date if prev else ""
 
         if done_now and not prev_done:
-            # właśnie zaznaczone jako zakończone
             done_date_iso = today
         elif (not done_now) and prev_done:
-            # właśnie odznaczone
             done_date_iso = ""
         else:
-            # bez zmiany stanu - bierz z tabeli jeśli istnieje, inaczej zachowaj poprzednią
             if pd.isna(done_date_raw):
                 done_date_iso = prev_done_date if prev else ""
             else:
@@ -166,7 +206,6 @@ def make_gantt(df: pd.DataFrame, show_done: bool):
         return
 
     df = df.copy()
-
     if not show_done:
         df = df[df["Zakończone"] == False]
 
@@ -174,12 +213,10 @@ def make_gantt(df: pd.DataFrame, show_done: bool):
         st.info("Brak zadań do pokazania przy aktualnym filtrze.")
         return
 
-    # koniec na wykresie: aktywne -> Deadline, zakończone -> Data zakończenia (lub Deadline)
     df["Koniec (wykres)"] = df["Deadline"]
     mask_done = df["Zakończone"] == True
     df.loc[mask_done, "Koniec (wykres)"] = df.loc[mask_done, "Data zakończenia"].fillna(df.loc[mask_done, "Deadline"])
 
-    # sekcje na osi Y: aktywne u góry, zakończone na dole
     df["Sekcja"] = df["Zakończone"].apply(lambda x: "✅ ZAKOŃCZONE" if x else "🟦 AKTYWNE")
     df["Sekcja_sort"] = pd.Categorical(df["Sekcja"], categories=["🟦 AKTYWNE", "✅ ZAKOŃCZONE"], ordered=True)
     df["Priorytet_sort"] = pd.Categorical(df["Priorytet"], categories=PRIORITY_ORDER, ordered=True)
@@ -215,13 +252,15 @@ def make_gantt(df: pd.DataFrame, show_done: bool):
     st.plotly_chart(fig, use_container_width=True)
 
 
-# ---------------- UI ----------------
-
 st.set_page_config(page_title="Moja linia zadań (Gantt)", layout="wide")
-st.title("Moja linia zadań — wykres Gantta")
+st.title("Moja linia zadań — wykres Gantta (Google Sheets)")
 
 if "tasks" not in st.session_state:
-    st.session_state.tasks = load_tasks()
+    try:
+        st.session_state.tasks = load_tasks()
+    except Exception as e:
+        st.error(f"Nie mogę połączyć się z Google Sheets: {e}")
+        st.stop()
 
 left, right = st.columns([1, 2], gap="large")
 
@@ -231,7 +270,6 @@ with left:
     with st.form("add_task", clear_on_submit=True):
         name = st.text_input("Nazwa zadania", placeholder="np. Budstol – doprecyzować warunki klimatyzacji")
         priority = st.selectbox("Priorytet", PRIORITY_ORDER, index=1)
-
         deadline = st.date_input("Deadline (planowany koniec)", value=date.today())
 
         deadline_only = st.checkbox("Ustaw start automatycznie na dziś (dodaję tylko deadline)", value=True)
@@ -241,7 +279,7 @@ with left:
         else:
             start = st.date_input("Start", value=date.today())
 
-        notes = st.text_area("Notatki (opcjonalnie)", height=90, placeholder="np. zależne od odpowiedzi prawnika")
+        notes = st.text_area("Notatki (opcjonalnie)", height=90)
 
         submitted = st.form_submit_button("➕ Dodaj")
         if submitted:
@@ -264,70 +302,39 @@ with left:
                         done_date="",
                     ))
                     save_tasks(st.session_state.tasks)
-                    st.success("Dodano.")
+                    st.success("Dodano i zapisano do Google Sheets.")
                     st.rerun()
 
     st.divider()
-    st.subheader("Edytuj / zakończ zadania (klik w tabeli)")
+    st.subheader("Edytuj / zakończ (klik w tabeli)")
 
     df = tasks_to_df(st.session_state.tasks)
 
     if df.empty:
         st.caption("Brak zadań.")
     else:
-        # Filtr priorytetów w tabeli (opcjonalnie)
-        pri_filter = st.multiselect("Filtr priorytetów w tabeli", PRIORITY_ORDER, default=PRIORITY_ORDER)
-        df_view = df[df["Priorytet"].isin(pri_filter)].copy()
-
         edited = st.data_editor(
-            df_view,
+            df,
             hide_index=True,
             use_container_width=True,
+            disabled=["id"],
             column_config={
                 "id": st.column_config.TextColumn("id", disabled=True),
-                "Zadanie": st.column_config.TextColumn("Zadanie"),
-                "Start": st.column_config.DateColumn("Start"),
-                "Deadline": st.column_config.DateColumn("Deadline"),
                 "Priorytet": st.column_config.SelectboxColumn("Priorytet", options=PRIORITY_ORDER),
                 "Zakończone": st.column_config.CheckboxColumn("Zakończone"),
-                "Data zakończenia": st.column_config.DateColumn("Data zakończenia"),
-                "Notatki": st.column_config.TextColumn("Notatki"),
             },
-            disabled=["id"],  # id nieedytowalne
             key="editor",
         )
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("💾 Zapisz zmiany"):
-                # scal zmiany: podmień tylko te wiersze, które były widoczne w df_view
-                df_full = df.copy()
-                edited_ids = set(edited["id"].astype(str).tolist())
-
-                # aktualizuj w pełnym df rekordy o tych id
-                for _, r in edited.iterrows():
-                    rid = str(r["id"])
-                    idx = df_full.index[df_full["id"].astype(str) == rid]
-                    if len(idx) == 1:
-                        df_full.loc[idx[0], :] = r
-
-                # walidacja dat
-                bad = df_full[df_full["Deadline"] < df_full["Start"]]
-                if not bad.empty:
-                    st.error("Masz co najmniej jedno zadanie, gdzie Deadline < Start. Popraw i zapisz ponownie.")
-                else:
-                    st.session_state.tasks = df_to_tasks(df_full, st.session_state.tasks)
-                    save_tasks(st.session_state.tasks)
-                    st.success("Zapisano.")
-                    st.rerun()
-
-        with col_b:
-            if st.button("🧹 Wyczyść wszystko"):
-                st.session_state.tasks = []
+        if st.button("💾 Zapisz zmiany"):
+            bad = edited[edited["Deadline"] < edited["Start"]]
+            if not bad.empty:
+                st.error("Masz co najmniej jedno zadanie, gdzie Deadline < Start.")
+            else:
+                st.session_state.tasks = df_to_tasks(edited, st.session_state.tasks)
                 save_tasks(st.session_state.tasks)
-                st.warning("Wyczyszczono.")
+                st.success("Zapisano do Google Sheets.")
                 st.rerun()
-
 
 with right:
     st.subheader("Oś czasu (Gantt)")
@@ -338,7 +345,7 @@ with right:
     with c1:
         show_done = st.checkbox("Pokaż zakończone", value=True)
     with c2:
-        pri_plot = st.multiselect("Priorytety", options=PRIORITY_ORDER, default=PRIORITY_ORDER)
+        pri_plot = st.multiselect("Priorytety", PRIORITY_ORDER, default=PRIORITY_ORDER)
     with c3:
         text_filter = st.text_input("Filtruj po nazwie", placeholder="np. Budstol / IT / badanie...")
 
